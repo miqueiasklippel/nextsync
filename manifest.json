@@ -1,7 +1,7 @@
 {
   "id": "nextsync",
   "name": "NextSync",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "minAppVersion": "1.13.1",
   "description": "Sync your vault with a Nextcloud folder over WebDAV, with conflict copies and deletion safeguards.",
   "author": "Klippel",
