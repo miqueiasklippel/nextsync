@@ -1,4 +1,5 @@
 import { App, Notice, PluginSettingTab, SecretComponent, Setting, SettingDefinitionItem } from "obsidian";
+import { DEFAULT_CONCURRENCY, MAX_CONCURRENCY, MIN_CONCURRENCY, clampConcurrency } from "./concurrency";
 import type NextSyncPlugin from "./main";
 import { validateRemoteFolder, validateServerUrl } from "./webdav";
 
@@ -14,6 +15,10 @@ export interface NextSyncSettings {
   confirmRemoteDeletion: boolean;
   maxDeletions: number;
   ignorePaths: string[];
+  syncHidden: boolean;
+  syncConfig: boolean;
+  syncPlugins: boolean;
+  concurrency: number;
 }
 
 export const DEFAULT_SETTINGS: NextSyncSettings = {
@@ -28,6 +33,10 @@ export const DEFAULT_SETTINGS: NextSyncSettings = {
   confirmRemoteDeletion: true,
   maxDeletions: 50,
   ignorePaths: [],
+  syncHidden: false,
+  syncConfig: false,
+  syncPlugins: false,
+  concurrency: DEFAULT_CONCURRENCY,
 };
 
 const CREDENTIAL_KEYS = new Set(["serverUrl", "loginName", "passwordSecretId"]);
@@ -62,6 +71,10 @@ export class NextSyncSettingTab extends PluginSettingTab {
       case "syncOnStartup":
       case "propagateDeletions":
       case "confirmRemoteDeletion":
+      case "syncHidden":
+      case "syncConfig":
+      case "syncPlugins":
+      case "concurrency":
         return settings[key];
       default:
         return undefined;
@@ -89,9 +102,15 @@ export class NextSyncSettingTab extends PluginSettingTab {
       case "maxDeletions":
         settings[key] = toWholeNumber(value);
         break;
+      case "concurrency":
+        settings.concurrency = clampConcurrency(Number(value));
+        break;
       case "syncOnStartup":
       case "propagateDeletions":
       case "confirmRemoteDeletion":
+      case "syncHidden":
+      case "syncConfig":
+      case "syncPlugins":
         settings[key] = value === true;
         break;
       default:
@@ -104,7 +123,7 @@ export class NextSyncSettingTab extends PluginSettingTab {
     }
     await this.plugin.saveSettings();
     if (key === "autoSyncMinutes") this.plugin.restartAutoSync();
-    if (key === "propagateDeletions") this.refreshDomState();
+    if (key === "propagateDeletions" || key === "syncConfig") this.refreshDomState();
   }
 
   getSettingDefinitions(): SettingDefinitionItem[] {
@@ -195,10 +214,58 @@ export class NextSyncSettingTab extends PluginSettingTab {
             control: { type: "toggle", key: "syncOnStartup" },
           },
           {
+            name: "Transferências simultâneas",
+            desc: `Quantos arquivos são enviados ou baixados ao mesmo tempo, de ${MIN_CONCURRENCY} a ${MAX_CONCURRENCY}. Valores maiores aceleram cofres grandes; use 1 em conexões instáveis.`,
+            aliases: ["paralelo", "simultâneas", "velocidade", "concurrency"],
+            control: {
+              type: "number",
+              key: "concurrency",
+              min: MIN_CONCURRENCY,
+              max: MAX_CONCURRENCY,
+              defaultValue: DEFAULT_CONCURRENCY,
+              validate: (value) => {
+                if (!Number.isInteger(value) || value < MIN_CONCURRENCY || value > MAX_CONCURRENCY) {
+                  return `Use um número inteiro de ${MIN_CONCURRENCY} a ${MAX_CONCURRENCY}.`;
+                }
+              },
+            },
+          },
+          {
             name: "Pastas ignoradas",
-            desc: `Uma por linha, relativas ao cofre. A pasta de configuração (${configDir}) e os arquivos e pastas ocultos já são ignorados.`,
+            desc: "Uma por linha, relativas ao cofre. Tudo o que estiver dentro delas fica fora da sincronização.",
             aliases: ["ignorar", "exclusões", "ignore"],
             control: { type: "textarea", key: "ignorePaths", rows: 4, placeholder: "Rascunhos\nAnexos/Grandes" },
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: "O que sincronizar",
+        items: [
+          {
+            name: "Arquivos e pastas ocultos",
+            desc:
+              "Inclui arquivos e pastas cujo nome começa com ponto, em qualquer lugar do cofre. " +
+              "As pastas .git e .trash nunca são sincronizadas.",
+            aliases: ["ocultos", "hidden", "ponto"],
+            control: { type: "toggle", key: "syncHidden" },
+          },
+          {
+            name: "Configurações do Obsidian",
+            desc:
+              `Sincroniza a pasta de configuração (${configDir}): preferências, atalhos, temas e trechos CSS. ` +
+              "O layout das janelas e os dados do NextSync nunca são sincronizados. " +
+              "As mudanças recebidas passam a valer depois de reiniciar o Obsidian.",
+            aliases: ["configuração", "config", "temas", "atalhos", "settings"],
+            control: { type: "toggle", key: "syncConfig" },
+          },
+          {
+            name: "Plugins da comunidade",
+            desc:
+              "Instala e atualiza nos outros dispositivos os mesmos plugins deste cofre, com as configurações de cada um. " +
+              "Exige a opção anterior. O próprio NextSync fica de fora.",
+            aliases: ["plugins", "extensões"],
+            control: { type: "toggle", key: "syncPlugins", disabled: () => !settings.syncConfig },
           },
         ],
       },

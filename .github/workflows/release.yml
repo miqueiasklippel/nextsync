@@ -55,6 +55,10 @@ jobs:
         if: steps.existing.outputs.found == 'false'
         run: npm run lint
 
+      - name: Test
+        if: steps.existing.outputs.found == 'false'
+        run: npm test
+
       - name: Build
         if: steps.existing.outputs.found == 'false'
         run: npm run build

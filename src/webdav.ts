@@ -1,4 +1,5 @@
 import { requestUrl, RequestUrlParam, RequestUrlResponse } from "obsidian";
+import { walkTree } from "./concurrency";
 
 export interface RemoteEntry {
   path: string;
@@ -6,13 +7,19 @@ export interface RemoteEntry {
   etag: string;
   size: number;
   mtime: number;
+  fileId: string;
 }
 
 export interface RemoteListing {
   files: Map<string, RemoteEntry>;
-  dirs: Set<string>;
+  dirs: Map<string, RemoteEntry>;
   rootExists: boolean;
   skipped: string[];
+}
+
+export interface PutResult {
+  etag: string;
+  fileId: string;
 }
 
 export interface NextcloudConfig {
@@ -25,6 +32,8 @@ export interface NextcloudConfig {
 
 export type DeleteResult = "deleted" | "missing" | "changed";
 
+export type MoveResult = "moved" | "missing" | "exists";
+
 export class NextcloudError extends Error {
   constructor(message: string, readonly status?: number) {
     super(message);
@@ -32,10 +41,12 @@ export class NextcloudError extends Error {
   }
 }
 
+const OC_NS = "http://owncloud.org/ns";
+
 const PROPFIND_BODY =
   '<?xml version="1.0" encoding="UTF-8"?>' +
-  '<d:propfind xmlns:d="DAV:"><d:prop>' +
-  "<d:resourcetype/><d:getetag/><d:getcontentlength/><d:getlastmodified/>" +
+  `<d:propfind xmlns:d="DAV:" xmlns:oc="${OC_NS}"><d:prop>` +
+  "<d:resourcetype/><d:getetag/><d:getcontentlength/><d:getlastmodified/><oc:fileid/>" +
   "</d:prop></d:propfind>";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -55,8 +66,8 @@ function header(res: RequestUrlResponse, name: string): string {
   return "";
 }
 
-function childText(el: Element, localName: string): string {
-  return el.getElementsByTagNameNS("DAV:", localName)[0]?.textContent?.trim() ?? "";
+function childText(el: Element, localName: string, namespace = "DAV:"): string {
+  return el.getElementsByTagNameNS(namespace, localName)[0]?.textContent?.trim() ?? "";
 }
 
 function describeStatus(status: number): string {
@@ -74,6 +85,15 @@ function describeStatus(status: number): string {
     default:
       return `Resposta inesperada do servidor (HTTP ${status}).`;
   }
+}
+
+export function normalizeEtag(etag: string): string {
+  return etag.trim().replace(/^W\//, "").replace(/^"|"$/g, "");
+}
+
+export function sameEtag(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  return normalizeEtag(a) === normalizeEtag(b);
 }
 
 export function encodePath(path: string): string {
@@ -144,6 +164,8 @@ export class NextcloudClient {
   readonly remoteRoot: string;
   private readonly auth: string;
   private readonly userId: string;
+  private readonly dirCreation = new Map<string, Promise<void>>();
+  private readonly createdDirIds = new Map<string, string>();
 
   constructor(config: NextcloudConfig) {
     this.server = validateServerUrl(config.serverUrl);
@@ -228,6 +250,7 @@ export class NextcloudClient {
         etag: "",
         size: 0,
         mtime: 0,
+        fileId: "",
       };
       for (const propstat of Array.from(response.getElementsByTagNameNS("DAV:", "propstat"))) {
         if (!/\s200\s/.test(` ${childText(propstat, "status")} `)) continue;
@@ -236,6 +259,7 @@ export class NextcloudClient {
         entry.size = parseInt(childText(propstat, "getcontentlength") || "0", 10) || 0;
         const modified = childText(propstat, "getlastmodified");
         entry.mtime = modified ? Date.parse(modified) || 0 : 0;
+        entry.fileId = childText(propstat, "fileid", OC_NS);
       }
       entries.push(entry);
     }
@@ -254,18 +278,16 @@ export class NextcloudClient {
     return this.parseMultistatus(res.text);
   }
 
-  async listAll(): Promise<RemoteListing> {
-    const listing: RemoteListing = { files: new Map(), dirs: new Set(), rootExists: true, skipped: [] };
-    const queue: string[] = [""];
+  async listAll(descends: (dir: string) => boolean, concurrency: number): Promise<RemoteListing> {
+    const listing: RemoteListing = { files: new Map(), dirs: new Map(), rootExists: true, skipped: [] };
 
-    while (queue.length > 0) {
-      const dir = queue.shift();
-      if (dir === undefined) break;
+    await walkTree([""], concurrency, async (dir) => {
       const entries = await this.propfind(dir, "1");
       if (entries === null) {
         if (dir === "") listing.rootExists = false;
-        continue;
+        return [];
       }
+      const children: string[] = [];
       for (const entry of entries) {
         if (entry.path === dir) continue;
         if (!isSafeRelativePath(entry.path)) {
@@ -273,13 +295,14 @@ export class NextcloudClient {
           continue;
         }
         if (entry.isDir) {
-          listing.dirs.add(entry.path);
-          queue.push(entry.path);
+          listing.dirs.set(entry.path, entry);
+          if (descends(entry.path)) children.push(entry.path);
         } else {
           listing.files.set(entry.path, entry);
         }
       }
-    }
+      return children;
+    });
     return listing;
   }
 
@@ -294,7 +317,7 @@ export class NextcloudClient {
     return { data: res.arrayBuffer, etag: header(res, "etag") };
   }
 
-  async put(relPath: string, data: ArrayBuffer, mtimeMs: number): Promise<string> {
+  async put(relPath: string, data: ArrayBuffer, mtimeMs: number): Promise<PutResult> {
     const headers: Record<string, string> = {};
     if (mtimeMs > 0) headers["X-OC-Mtime"] = String(Math.floor(mtimeMs / 1000));
     const res = await this.request({
@@ -308,12 +331,42 @@ export class NextcloudClient {
       throw new NextcloudError(describeStatus(res.status), res.status);
     }
     const etag = header(res, "etag") || header(res, "oc-etag");
-    return etag || ((await this.stat(relPath))?.etag ?? "");
+    const fileId = header(res, "oc-fileid");
+    if (etag && fileId) return { etag, fileId };
+    const stat = await this.stat(relPath);
+    return { etag: etag || (stat?.etag ?? ""), fileId: fileId || (stat?.fileId ?? "") };
+  }
+
+  async move(from: string, to: string, known: Set<string>): Promise<MoveResult> {
+    const parent = to.includes("/") ? to.slice(0, to.lastIndexOf("/")) : "";
+    if (parent) await this.ensureDir(parent, known);
+    const res = await this.request({
+      url: this.urlFor(from),
+      method: "MOVE",
+      headers: { Destination: this.urlFor(to), Overwrite: "F" },
+    });
+    if (res.status === 201 || res.status === 204) return "moved";
+    if (res.status === 404) return "missing";
+    if (res.status === 412) return "exists";
+    throw new NextcloudError(describeStatus(res.status), res.status);
+  }
+
+  async isEmptyDir(relPath: string): Promise<boolean> {
+    const entries = await this.propfind(relPath, "1");
+    if (entries === null) return false;
+    return entries.every((entry) => entry.path === relPath);
+  }
+
+  async deleteEmptyDir(relPath: string): Promise<boolean> {
+    if (!relPath || !(await this.isEmptyDir(relPath))) return false;
+    const res = await this.request({ url: this.urlFor(relPath) + "/", method: "DELETE" });
+    if (res.status === 204 || res.status === 200 || res.status === 404) return true;
+    throw new NextcloudError(describeStatus(res.status), res.status);
   }
 
   async delete(relPath: string, expectedEtag?: string): Promise<DeleteResult> {
     const headers: Record<string, string> = {};
-    if (expectedEtag) headers["If-Match"] = expectedEtag;
+    if (expectedEtag) headers["If-Match"] = `"${normalizeEtag(expectedEtag)}"`;
     const res = await this.request({ url: this.urlFor(relPath), method: "DELETE", headers });
     if (res.status === 204 || res.status === 200) return "deleted";
     if (res.status === 404) return "missing";
@@ -321,11 +374,16 @@ export class NextcloudClient {
     throw new NextcloudError(describeStatus(res.status), res.status);
   }
 
-  private async mkcol(url: string): Promise<void> {
+  private async mkcol(url: string): Promise<string> {
     const res = await this.request({ url, method: "MKCOL" });
     if (res.status !== 201 && res.status !== 405) {
       throw new NextcloudError(describeStatus(res.status), res.status);
     }
+    return res.status === 201 ? header(res, "oc-fileid") : "";
+  }
+
+  createdFolderId(relDir: string): string | undefined {
+    return this.createdDirIds.get(relDir);
   }
 
   async ensureRoot(): Promise<void> {
@@ -341,8 +399,20 @@ export class NextcloudClient {
     for (const segment of relDir.split("/").filter((s) => s.length > 0)) {
       current = current ? `${current}/${segment}` : segment;
       if (known.has(current)) continue;
-      await this.mkcol(this.urlFor(current));
-      known.add(current);
+      await this.createDirOnce(current, known);
     }
+  }
+
+  private createDirOnce(relDir: string, known: Set<string>): Promise<void> {
+    const pending = this.dirCreation.get(relDir);
+    if (pending) return pending;
+    const creation = this.mkcol(this.urlFor(relDir))
+      .then((fileId) => {
+        if (fileId) this.createdDirIds.set(relDir, fileId);
+        known.add(relDir);
+      })
+      .finally(() => this.dirCreation.delete(relDir));
+    this.dirCreation.set(relDir, creation);
+    return creation;
   }
 }
